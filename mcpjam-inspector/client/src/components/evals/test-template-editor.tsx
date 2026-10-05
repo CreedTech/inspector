@@ -26,6 +26,7 @@ import { track } from "@/lib/analytics";
 import { useActorCanQuery } from "@/hooks/use-actor-can-query";
 import { useSuiteCapabilities } from "@/hooks/use-suite-capabilities";
 import { mintCaseId } from "@mcpjam/sdk/contract";
+import type { ModelSelection } from "@mcpjam/sdk/browser";
 import {
   Circle,
   Code2,
@@ -114,6 +115,7 @@ import {
   ensureLocalEnvironmentServers,
   planQuickRunTargets,
   quickRunClientIds,
+  quickRunEnvironmentSelection,
   resolveQuickRunEnvironments,
 } from "./environment-quick-run";
 import { isHostedMode } from "@/lib/apis/mode-client";
@@ -220,10 +222,17 @@ import {
   resolveIterationModelValue,
   resolveLatestCompareRunId,
   resolveModelOptionLabel,
+  caseModelEntriesForCompareValues,
+  caseModelEntriesUnchanged,
+  quickRunKey,
+  quickRunModelValue,
 } from "./compare-playground-helpers";
+import { modelTarget } from "@/lib/model-target";
+import { modelTargetLabel } from "@/lib/environment-label";
 import type {
   CompareRunRecord,
   EditorMode,
+  EvalCase,
   EvalIteration,
   EvalSuiteRun,
   RunColumnTab,
@@ -278,7 +287,10 @@ import {
 import { coverageDetailByStage } from "../evaluate/case-scorecard/case-coverage";
 import { groupCaseIterations } from "./runs/group-case-iterations";
 import { useSuggestedScorers } from "../evaluate/case-scorecard/suggested-from-run-section";
-import { CaseRunSetup } from "../evaluate/case-workspace/case-run-setup";
+import {
+  CaseRunSetup,
+  type CaseRunPick,
+} from "../evaluate/case-workspace/case-run-setup";
 import {
   caseHasOwnAssertion,
   initialToolsChoice,
@@ -313,6 +325,7 @@ import { parseStepStatusById } from "@/shared/eval-step-replay";
 import { chainForQuickRunIteration } from "../evaluate/simple-case/quick-run-chain";
 import { TrialJudgeReviewPanel } from "./trial-judge-review";
 import { TrialScorecard } from "../evaluate/case-scorecard/trial-scorecard";
+import type { ToolCatalogStatus } from "../evaluate/case-scorecard/route-row";
 import { IterationReportScorecard } from "../evaluate/case-scorecard/iteration-report-subscriber";
 import { authoredForTrial } from "../evaluate/case-scorecard/trial-authored";
 
@@ -1056,7 +1069,13 @@ export function TestTemplateEditor({
       _meta?: Record<string, unknown>;
     }>
   >([]);
+  // Quick-run picks, keyed by `quickRunKey`: a model value, plus its effort
+  // when it runs at one (Sonnet·Low and Sonnet·High are two picks).
   const [selectedModelValues, setSelectedModelValues] = useState<string[]>([]);
+  // The selection behind each pick key that has one.
+  const [quickRunSelections, setQuickRunSelections] = useState<
+    Record<string, ModelSelection>
+  >({});
   const [compareRunRecords, setCompareRunRecords] = useState<
     Record<string, CompareRunRecord>
   >({});
@@ -1766,6 +1785,9 @@ export function TestTemplateEditor({
         (server) =>
           ids.includes(server.serverId) && server.action === "reconnect",
       );
+      // One server still needing authorization must not stop the others from
+      // refreshing; it is reported after they reload.
+      const unauthorized: string[] = [];
       for (const server of failed) {
         const name =
           projectServers?.find((candidate) => candidate._id === server.serverId)
@@ -1782,16 +1804,21 @@ export function TestTemplateEditor({
             allowInteractiveOAuthFlow: true,
           });
           if (!result.readyServerNames.includes(name))
-            throw new Error(
-              "Server authorization is required. Check the connection and retry.",
-            );
+            unauthorized.push(server.serverId);
         }
       }
       await loadEvalToolMetadata(
-        { ...metadataTarget, serverIds: ids },
+        {
+          ...metadataTarget,
+          serverIds: ids.filter((id) => !unauthorized.includes(id)),
+        },
         loadServerMetadata,
         true,
       );
+      if (unauthorized.length)
+        throw new Error(
+          "Server authorization is required. Check the connection and retry.",
+        );
     },
     [
       metadataTarget,
@@ -1822,6 +1849,37 @@ export function TestTemplateEditor({
   useEffect(() => {
     setAvailableTools(toolsMetadataState.tools);
   }, [toolsMetadataState]);
+  // Per server, not per merged list: harness built-ins or a second healthy
+  // server would otherwise hide one whose tools never arrived. A server that
+  // loaded empty, or kept its last catalogue through a failed refresh, owes
+  // nothing and is not reported.
+  const missingToolsStatus = (status: "loading" | "error") =>
+    toolsMetadataState.servers.some(
+      (server) => server.status === status && server.tools.length === 0,
+    );
+  const toolsStatus: ToolCatalogStatus | undefined = missingToolsStatus(
+    "loading",
+  )
+    ? "loading"
+    : missingToolsStatus("error")
+      ? "error"
+      : undefined;
+  // Retry can reconnect with an interactive OAuth flow; a second click while
+  // one runs would open a second.
+  const retryingToolsRef = useRef(false);
+  const handleRetryTools = useCallback(() => {
+    if (retryingToolsRef.current) return;
+    retryingToolsRef.current = true;
+    retryToolsMetadata()
+      .catch((error: unknown) => {
+        toast.error(
+          error instanceof Error ? error.message : "Couldn't reload tools",
+        );
+      })
+      .finally(() => {
+        retryingToolsRef.current = false;
+      });
+  }, [retryToolsMetadata]);
 
   const handleTitleClick = () => {
     setIsEditingTitle(true);
@@ -2773,17 +2831,19 @@ export function TestTemplateEditor({
       return;
     }
 
-    const nextModels = buildSelectedCompareModels(modelValues);
-
-    const currentModels: Array<{ provider: string; model: string }> =
-      currentTestCase.models ?? [];
-    const modelsUnchanged =
-      currentModels.length === nextModels.length &&
-      currentModels.every(
-        (model, index) =>
-          model.provider === nextModels[index]?.provider &&
-          model.model === nextModels[index]?.model,
-      );
+    const currentModels: EvalCase["models"] = currentTestCase.models ?? [];
+    // Saved entries keep their selections (efforts, and two entries of one
+    // model); only newly picked models are built from the catalog row.
+    const nextModels = caseModelEntriesForCompareValues(
+      modelValues,
+      currentModels,
+      (modelValue) => buildSelectedCompareModels([modelValue])[0]!,
+    );
+    // Selection-aware: an effort-only edit is a change.
+    const modelsUnchanged = caseModelEntriesUnchanged(
+      currentModels,
+      nextModels,
+    );
 
     if (!hasUnsavedChanges && modelsUnchanged) {
       return;
@@ -2835,6 +2895,35 @@ export function TestTemplateEditor({
       ),
     [modelOptions],
   );
+  // Run labels for the picks: the model's label, plus only what tells one
+  // model's picks apart ("Sonnet 4.5 · High" beside "Sonnet 4.5 · Low").
+  const compareLabelByValue = useMemo(() => {
+    const targets = selectedModelValues.map((key) =>
+      modelTarget(parseModelValue(key).model, quickRunSelections[key]),
+    );
+    const labels: Record<string, string> = { ...modelLabelByValue };
+    selectedModelValues.forEach((key, index) => {
+      labels[key] = modelTargetLabel(
+        targets[index]!,
+        targets.filter((_, other) => other !== index),
+        () =>
+          resolveModelOptionLabel(quickRunModelValue(key), modelLabelByValue),
+      );
+    });
+    return labels;
+  }, [modelLabelByValue, quickRunSelections, selectedModelValues]);
+  const handleQuickRunPicksChange = useCallback((picks: CaseRunPick[]) => {
+    const keys: string[] = [];
+    const selections: Record<string, ModelSelection> = {};
+    for (const { modelValue, selection } of picks) {
+      const key = quickRunKey(modelValue, selection);
+      if (keys.includes(key)) continue;
+      keys.push(key);
+      if (key !== modelValue && selection) selections[key] = selection;
+    }
+    setSelectedModelValues(keys);
+    setQuickRunSelections(selections);
+  }, []);
 
   useEffect(() => {
     if (!currentTestCase?._id) {
@@ -2873,6 +2962,7 @@ export function TestTemplateEditor({
 
     initializedSelectionCaseRef.current = currentTestCase._id;
     setSelectedModelValues(routeAnchoredModels);
+    setQuickRunSelections({});
   }, [
     currentTestCase,
     modelOptions,
@@ -2912,7 +3002,7 @@ export function TestTemplateEditor({
     setCompareRunRecords((current) =>
       buildHistoricalCompareRunRecords({
         selectedModelValues,
-        modelLabelByValue,
+        modelLabelByValue: compareLabelByValue,
         iterations: recentIterations,
         testCase: currentTestCase,
         existingRecords: current,
@@ -2921,7 +3011,7 @@ export function TestTemplateEditor({
     );
   }, [
     currentTestCase,
-    modelLabelByValue,
+    compareLabelByValue,
     recentIterations,
     routeCompareAnchorIteration,
     routeCompareAnchorIterationId,
@@ -2952,7 +3042,7 @@ export function TestTemplateEditor({
   useEffect(() => {
     setPersistedTestCaseModelValue(
       selectedTestCaseId,
-      selectedModelValues[0] ?? null,
+      selectedModelValues[0] ? quickRunModelValue(selectedModelValues[0]) : null,
     );
   }, [selectedModelValues, selectedTestCaseId]);
 
@@ -2974,11 +3064,11 @@ export function TestTemplateEditor({
 
         return buildCompareRunRecord({
           modelValue,
-          modelLabel: resolveModelOptionLabel(modelValue, modelLabelByValue),
+          modelLabel: resolveModelOptionLabel(modelValue, compareLabelByValue),
           iteration: null,
         });
       }),
-    [compareRunRecords, modelLabelByValue, selectedModelValues],
+    [compareRunRecords, compareLabelByValue, selectedModelValues],
   );
 
   // Multi-model compare still uses the dedicated side-by-side grid view; the
@@ -3117,10 +3207,14 @@ export function TestTemplateEditor({
             serverAttachmentId: quickRunServerGroup,
             targets: runModelValues.map((value) => {
               const modelId = parseModelValue(value).model;
+              const modelSelection = quickRunSelections[value];
               return {
                 key: value,
                 hostId: clientId,
                 ...(modelId ? { modelId } : {}),
+                // A pick at a chosen effort runs (or derives) the environment
+                // at that effort; a plain pick reuses the suite's as before.
+                ...(modelSelection ? { modelSelection } : {}),
               };
             }),
             clientModelId: (hostId) =>
@@ -3172,7 +3266,9 @@ export function TestTemplateEditor({
 
     if (startsNewCompareSession) {
       try {
-        await persistCompareRunDraft(savePayload, selectedModelValues);
+        await persistCompareRunDraft(savePayload, [
+          ...new Set(selectedModelValues.map(quickRunModelValue)),
+        ]);
       } catch (error) {
         console.error("Failed to save test case before compare run:", error);
         toast.error(
@@ -3204,7 +3300,7 @@ export function TestTemplateEditor({
       runModelValues.map(async (modelValue) => {
         const modelLabel = resolveModelOptionLabel(
           modelValue,
-          modelLabelByValue,
+          compareLabelByValue,
         );
         const advancedConfig = mergeAdvancedConfigWithOverride({
           baseAdvancedConfig: savePayload.advancedConfig,
@@ -3254,7 +3350,7 @@ export function TestTemplateEditor({
                 },
               },
               testCase: currentTestCase,
-              selectedModel: modelValue,
+              selectedModel: quickRunModelValue(modelValue),
               getAccessToken,
               namedHostId: quickRunHostPlan.namedHostId,
               testCaseOverrides,
@@ -3270,7 +3366,10 @@ export function TestTemplateEditor({
 
     for (const [index, preparedResult] of preparedResults.entries()) {
       const modelValue = runModelValues[index]!;
-      const modelLabel = resolveModelOptionLabel(modelValue, modelLabelByValue);
+      const modelLabel = resolveModelOptionLabel(
+        modelValue,
+        compareLabelByValue,
+      );
 
       if (preparedResult.status === "fulfilled") {
         preparedRuns.push(preparedResult.value);
@@ -3591,62 +3690,70 @@ export function TestTemplateEditor({
             });
           } catch (error) {
             if (abortController.signal.aborted) {
-              let resolved!: CompareRunRecord;
-              setCompareRunRecords((previous) => {
-                const existing = previous[modelValue];
-                // A retry starts a newer request for this model and aborts the
-                // old controller. If that old abort rejects later, it must not
-                // overwrite the newer running/completed row as cancelled.
-                if (compareRequestGenByModelRef.current[modelValue] !== myGen) {
-                  resolved =
-                    existing ??
-                    buildCompareRunRecord({
-                      modelValue,
-                      modelLabel,
-                      iteration: null,
-                      completedAt: Date.now(),
-                    });
-                  return previous;
-                }
-                const base = buildCompareRunRecord({
-                  modelValue,
-                  modelLabel,
-                  iteration: null,
-                  cancelled: true,
-                  startedAt: existing?.startedAt ?? null,
-                  completedAt: Date.now(),
+              // Resolve from inside the updater, like the stream-completed path
+              // above: React may defer the updater, so a value assigned there
+              // isn't ready right after setCompareRunRecords returns.
+              return new Promise<CompareRunRecord>((resolve) => {
+                setCompareRunRecords((previous) => {
+                  const existing = previous[modelValue];
+                  // A retry starts a newer request for this model and aborts the
+                  // old controller. If that old abort rejects later, it must not
+                  // overwrite the newer running/completed row as cancelled.
+                  if (
+                    compareRequestGenByModelRef.current[modelValue] !== myGen
+                  ) {
+                    resolve(
+                      existing ??
+                        buildCompareRunRecord({
+                          modelValue,
+                          modelLabel,
+                          iteration: null,
+                          completedAt: Date.now(),
+                        }),
+                    );
+                    return previous;
+                  }
+                  const base = buildCompareRunRecord({
+                    modelValue,
+                    modelLabel,
+                    iteration: null,
+                    cancelled: true,
+                    startedAt: existing?.startedAt ?? null,
+                    completedAt: Date.now(),
+                  });
+                  const tokensUsed =
+                    existing?.streamingMetrics?.tokensUsed ??
+                    existing?.metrics.tokensUsed ??
+                    0;
+                  const toolCallCount =
+                    existing?.streamingMetrics?.toolCallCount ??
+                    existing?.metrics.toolCallCount ??
+                    0;
+                  const cancelledRecord: CompareRunRecord = {
+                    ...base,
+                    streamingTrace: existing?.streamingTrace,
+                    streamingDraftMessages: existing?.streamingDraftMessages,
+                    streamingActualToolCalls:
+                      existing?.streamingActualToolCalls,
+                    streamingMetrics:
+                      existing?.streamingMetrics != null
+                        ? existing.streamingMetrics
+                        : undefined,
+                    streamingStepStatus: existing?.streamingStepStatus,
+                    streamingLiveBrowserSteps:
+                      existing?.streamingLiveBrowserSteps,
+                    streamingLiveBrowserFrameSequence:
+                      existing?.streamingLiveBrowserFrameSequence,
+                    metrics: {
+                      ...base.metrics,
+                      toolCallCount,
+                      tokensUsed,
+                    },
+                  };
+                  resolve(cancelledRecord);
+                  return { ...previous, [modelValue]: cancelledRecord };
                 });
-                const tokensUsed =
-                  existing?.streamingMetrics?.tokensUsed ??
-                  existing?.metrics.tokensUsed ??
-                  0;
-                const toolCallCount =
-                  existing?.streamingMetrics?.toolCallCount ??
-                  existing?.metrics.toolCallCount ??
-                  0;
-                resolved = {
-                  ...base,
-                  streamingTrace: existing?.streamingTrace,
-                  streamingDraftMessages: existing?.streamingDraftMessages,
-                  streamingActualToolCalls: existing?.streamingActualToolCalls,
-                  streamingMetrics:
-                    existing?.streamingMetrics != null
-                      ? existing.streamingMetrics
-                      : undefined,
-                  streamingStepStatus: existing?.streamingStepStatus,
-                  streamingLiveBrowserSteps:
-                    existing?.streamingLiveBrowserSteps,
-                  streamingLiveBrowserFrameSequence:
-                    existing?.streamingLiveBrowserFrameSequence,
-                  metrics: {
-                    ...base.metrics,
-                    toolCallCount,
-                    tokensUsed,
-                  },
-                };
-                return { ...previous, [modelValue]: resolved };
               });
-              return resolved;
             }
             const message = getBillingErrorMessage(
               error,
@@ -3822,7 +3929,11 @@ export function TestTemplateEditor({
     ? buildCaseChatHandoff({
         caseId: String(currentTestCase._id),
         serverNames: effectiveSuiteServers,
-        modelId: previewRecord?.model ?? selectedModelValues[0],
+        modelId:
+          previewRecord?.model ??
+          (selectedModelValues[0] !== undefined
+            ? quickRunModelValue(selectedModelValues[0])
+            : undefined),
         advancedConfig: currentAdvancedConfig,
       })
     : null;
@@ -4172,6 +4283,8 @@ export function TestTemplateEditor({
                   current ? { ...current, predicates: next } : current,
                 )
               }
+              toolsStatus={toolsStatus}
+              onRetryTools={handleRetryTools}
               availableTools={assertableTools}
               suiteServers={effectiveSuiteServers}
               projectServers={projectServers}
@@ -4377,6 +4490,12 @@ export function TestTemplateEditor({
                     availableModels={availableModels}
                     disabled={isRunningCompare}
                     onModelsChange={setSelectedModelValues}
+                    {...(isEnvironmentSuite
+                      ? {
+                          onPicksChange: handleQuickRunPicksChange,
+                          selections: quickRunSelections,
+                        }
+                      : {})}
                     trials={editForm?.runs ?? DEFAULTS.RUNS_PER_TEST}
                     onTrialsChange={(next) =>
                       setEditForm((current) =>
@@ -4396,6 +4515,22 @@ export function TestTemplateEditor({
                       label: option.label,
                     }))}
                     onHostChange={setQuickRunHostSelection}
+                    {...(isEnvironmentSuite && attachedEnvironments
+                      ? {
+                          environmentSelection: (modelId: string) =>
+                            quickRunEnvironmentSelection(
+                              attachedEnvironments,
+                              quickRunHostSelection ??
+                                quickRunClientIds(attachedEnvironments)[0] ??
+                                "",
+                              modelId,
+                              (hostId) =>
+                                projectHosts
+                                  .find((host) => host.hostId === hostId)
+                                  ?.modelId?.trim() || undefined,
+                            ),
+                        }
+                      : {})}
                     {...(isEnvironmentSuite && projectId
                       ? {
                           serverGroup: {
@@ -4861,6 +4996,8 @@ export function TestTemplateEditor({
                       suiteDefaultPredicates={
                         (suite?.defaultPredicates ?? []) as Predicate[]
                       }
+                      toolsStatus={toolsStatus}
+                      onRetryTools={handleRetryTools}
                       availableTools={assertableTools}
                       suiteServers={effectiveSuiteServers}
                       projectServers={projectServers}
@@ -4975,6 +5112,8 @@ export function TestTemplateEditor({
                       suiteDefaultPredicates={
                         (suite?.defaultPredicates ?? []) as Predicate[]
                       }
+                      toolsStatus={toolsStatus}
+                      onRetryTools={handleRetryTools}
                       availableTools={assertableTools.map((tool) =>
                         typeof tool === "string" ? tool : tool.name,
                       )}

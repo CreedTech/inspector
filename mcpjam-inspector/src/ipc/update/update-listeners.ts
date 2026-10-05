@@ -7,6 +7,11 @@ import {
   powerMonitor,
 } from "electron";
 import log from "electron-log";
+import {
+  rememberInstallFailure,
+  reportPendingInstallResults,
+} from "./update-outcome.js";
+import { beginUpdateShutdown } from "./update-shutdown.js";
 import { UpdateClock } from "./update-clock.js";
 import type {
   UpdateStatus,
@@ -75,7 +80,15 @@ function persist(): boolean {
 }
 function report(reason: UpdateFailureReason): void {
   const a = ensureAttempt();
-  if (app.isPackaged) reportUpdateFailure(a, reason);
+  if (app.isPackaged) {
+    const shutdown =
+      a.phase === "installing" &&
+      (reason === "shutdown_stuck" || reason === "install_timeout");
+    const eventId = shutdown
+      ? rememberInstallFailure(app.getPath("userData"), a)
+      : undefined;
+    reportUpdateFailure(a, reason, eventId);
+  }
 }
 
 function setStatus(status: UpdateStatus): void {
@@ -339,6 +352,7 @@ function install(onQuit = false): void {
   quitAndInstallCalled = true;
   isQuittingForUpdate = true;
   try {
+    beginUpdateShutdown();
     autoUpdater.quitAndInstall();
     // The call can synchronously emit an error. Do not re-arm a watchdog after
     // its error handler has already switched to recovery or failure.
@@ -398,6 +412,22 @@ function restoreAttempt(): void {
     return;
   }
   if (loaded.kind === "expired") {
+    // An old background download is not a failed user-requested recovery.
+    // Discard its bookkeeping and let normal polling discover the update again.
+    if (
+      (attempt.phase === "downloading" || attempt.phase === "retry_waiting") &&
+      !attempt.userRequested &&
+      !attempt.downloadRequested &&
+      !attempt.downloadRecoveryRequested &&
+      attempt.retries === 0
+    ) {
+      if (!removeAttempt(markerPath())) {
+        finishFailure("marker_write_failed");
+        return;
+      }
+      attempt = undefined;
+      return;
+    }
     // Expiry revokes unattended recovery, not verification: a successful
     // update is still successful when the user reopens the app next week.
     finishFailure("recovery_expired");
@@ -589,7 +619,10 @@ export function setupAutoUpdaterEvents(): void {
     });
     if (a.userRequested) install();
   });
-  if (app.isPackaged) restoreAttempt();
+  if (app.isPackaged) {
+    void reportPendingInstallResults(app.getPath("userData"), app.getVersion());
+    restoreAttempt();
+  }
 }
 
 export function startUpdatePolling(): void {
