@@ -221,8 +221,10 @@ COPY --from=prod-deps /usr/src/app/mcpjam-inspector/node_modules ./node_modules
 # Invoked through the package entry point, not `npx playwright`: `npm prune`
 # in the prod-deps stage drops the package's .bin link while keeping the
 # package itself, and npx would fall back to fetching an unpinned copy.
+# Playwright hoists to the root node_modules, not the workspace-local one under
+# this WORKDIR, so the path is absolute.
 USER root
-RUN node ./node_modules/playwright/cli.js install --with-deps chromium \
+RUN node /usr/src/app/node_modules/playwright/cli.js install --with-deps chromium \
     && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
 USER node
 
