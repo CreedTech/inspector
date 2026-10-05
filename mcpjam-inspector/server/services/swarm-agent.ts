@@ -9,6 +9,7 @@ import type { Predicate } from "@mcpjam/sdk/predicates";
 import type { HostComputerResource } from "../utils/built-in-tools/registry.js";
 import type { PinnedSkillArtifact } from "../../shared/skill-types.js";
 import {
+  localHarnessCapabilities,
   runnerCapabilities,
   swarmSponsorshipCapabilities,
 } from "./evals/runner-capabilities.js";
@@ -493,12 +494,19 @@ export async function fetchPinnedSkill(
 /**
  * What this process declares on `runs/create` and on the funding preview. One
  * list for both, so the preview describes exactly the allocation the launch
- * will get.
+ * will get. A launch for the local venue also names the harnesses it will run
+ * (`local-harness:<id>`), which only `runs/create` carries.
  */
-export function swarmRunnerCapabilities(): string[] {
+export function swarmRunnerCapabilities(local?: {
+  runtimeVenue?: "hosted" | "local";
+  localHarnessIds?: readonly string[];
+}): string[] {
   return [
     ...runnerCapabilities(),
     "swarm-standard-checks-v1",
+    ...(local?.runtimeVenue === "local"
+      ? localHarnessCapabilities(local.localHarnessIds)
+      : []),
     ...swarmSponsorshipCapabilities(),
   ];
 }
@@ -623,6 +631,12 @@ export async function createJourneyRun(
   bearer: string,
   args: {
     runtimeVenue?: "hosted" | "local";
+    /**
+     * The harnesses this runner will execute locally for this wave, checked
+     * by the launch. Declared as `local-harness:<id>` so the backend stamps
+     * exactly those targets local.
+     */
+    localHarnessIds?: readonly string[];
     projectId: string;
     journeyRefId: string;
     launchKey: string;
@@ -650,7 +664,10 @@ export async function createJourneyRun(
   // Asserted by this process, never a caller: the runner is the only honest
   // source for what it can execute. One list feeds the body and the
   // attestation header, so they cannot disagree.
-  const capabilities = swarmRunnerCapabilities();
+  const capabilities = swarmRunnerCapabilities({
+    runtimeVenue: args.runtimeVenue,
+    localHarnessIds: args.localHarnessIds,
+  });
   const data = await postJson<{
     ok?: boolean;
     runId?: string;

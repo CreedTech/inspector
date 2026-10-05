@@ -966,6 +966,23 @@ export {
   selectionKey,
   defaultFallbackForPurpose,
 } from "./host-config/index.js";
+export {
+  reasoningEffortProviderOptions,
+  selectionConfigKey,
+  selectionIfMatches,
+  isDefaultSelection,
+  comparisonKey,
+  executionVariantSelectionKey,
+  selectionDistinguishers,
+  defaultReasoningEffort,
+  supportedReasoningEfforts,
+  harnessReasoningEfforts,
+} from "./host-config/index.js";
+export type {
+  ReasoningEffortProviderOptions,
+  ReasoningEffortRoute,
+  SupportedReasoningEffortsInput,
+} from "./host-config/index.js";
 export type {
   ModelSelection,
   ModelSelectionSource,

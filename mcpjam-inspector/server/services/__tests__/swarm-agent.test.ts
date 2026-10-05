@@ -350,6 +350,41 @@ describe("swarm-agent sponsored swarm allowance — capability negotiation", () 
     expect(createBody().runnerCapabilities).toContain("swarm-sponsorship-v1");
   });
 
+  it("names the harnesses of a local launch beside the sponsorship capability", async () => {
+    vi.stubEnv("INSPECTOR_SERVICE_TOKEN", "svc-token");
+    fetchMock.mockResolvedValue(Response.json(okCreateResponse()));
+
+    await createJourneyRun(CONVEX_HTTP_URL, "token", {
+      ...CREATE_ARGS,
+      runtimeVenue: "local",
+      localHarnessIds: ["codex", "claude-code"],
+    });
+
+    expect(createBody().runnerCapabilities).toEqual([
+      ...runnerCapabilities(),
+      "swarm-standard-checks-v1",
+      "local-harness:claude-code",
+      "local-harness:codex",
+      "swarm-sponsorship-v1",
+    ]);
+  });
+
+  it("names no local harness on a hosted launch, whatever the caller passes", async () => {
+    vi.stubEnv("INSPECTOR_SERVICE_TOKEN", "");
+    fetchMock.mockResolvedValue(Response.json(okCreateResponse()));
+
+    await createJourneyRun(CONVEX_HTTP_URL, "token", {
+      ...CREATE_ARGS,
+      localHarnessIds: ["codex"],
+    });
+
+    expect(
+      createBody().runnerCapabilities.some((capability: string) =>
+        capability.startsWith("local-harness:"),
+      ),
+    ).toBe(false);
+  });
+
   // The backend drops swarm-sponsorship-v1 from a request that does not carry
   // the service token, so the declaration and the proof travel together.
   const createHeaders = () =>

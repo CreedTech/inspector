@@ -142,6 +142,7 @@ import {
 import { useAppState, type ServerWithName } from "./hooks/use-app-state";
 import { useActorKey } from "./hooks/use-actor-key";
 import { useIsMemberActor } from "./hooks/use-is-member-actor";
+import { FeedbackReporterProvider } from "./components/support/FeedbackReporterContext";
 import {
   PreferencesStoreProvider,
   usePreferencesStore,
@@ -169,6 +170,18 @@ import type { BillingFeatureName } from "./hooks/useOrganizationBilling";
 // Import global styles
 import "./index.css";
 import { track } from "./lib/analytics";
+import {
+  trackFirstRunConnectionCancelled,
+  trackFirstRunConnectionFailed,
+  trackFirstRunConnectionStarted,
+  trackFirstRunConnectionSucceeded,
+  trackFirstRunPlaygroundOpened,
+  trackFirstRunServerSelected,
+  type FirstRunAuthentication,
+  type FirstRunCancelStage,
+  type FirstRunConnectionAnalyticsContext,
+  type FirstRunServerKind as FirstRunAnalyticsServerKind,
+} from "./lib/first-run-onboarding-analytics";
 import {
   getInitialThemeMode,
   updateThemeMode,
@@ -406,6 +419,57 @@ const OCCUPATION_GATE_ROLLOUT_MS = Date.parse("2026-04-29T00:00:00.000Z");
 const FIRST_RUN_PLAYGROUND_ROLLOUT_MS = Date.parse("2026-06-16T00:00:00.000Z");
 const AUTH_EXIT_RUNTIME_CLEANUP_TIMEOUT_MS = 2_500;
 
+function firstRunAuthentication(source: {
+  authMethod?: unknown;
+  useOAuth?: boolean;
+}): FirstRunAuthentication | undefined {
+  const { authMethod } = source;
+  if (
+    authMethod === "auto" ||
+    authMethod === "oauth" ||
+    authMethod === "none"
+  ) {
+    return authMethod;
+  }
+  return source.useOAuth === false ? "none" : undefined;
+}
+
+function firstRunAnalyticsContextFromDraft(
+  serverKind: FirstRunAnalyticsServerKind,
+  draft: Pick<ServerFormData, "type" | "authMethod" | "useOAuth">,
+): FirstRunConnectionAnalyticsContext {
+  const authentication = firstRunAuthentication(draft);
+  return {
+    serverKind,
+    transport: draft.type,
+    ...(authentication ? { authentication } : {}),
+  };
+}
+
+function firstRunAnalyticsContextFromServer(
+  serverKind: FirstRunAnalyticsServerKind,
+  server: ServerWithName | undefined,
+): FirstRunConnectionAnalyticsContext {
+  if (serverKind === "demo") {
+    return { serverKind, transport: "http", authentication: "none" };
+  }
+  if (!server) return { serverKind };
+
+  const authentication = firstRunAuthentication(server);
+  return {
+    serverKind,
+    transport: server.config.command ? "stdio" : "http",
+    ...(authentication ? { authentication } : {}),
+  };
+}
+
+function mergeFirstRunAnalyticsContext(
+  current: FirstRunConnectionAnalyticsContext | null,
+  fallback: FirstRunConnectionAnalyticsContext,
+): FirstRunConnectionAnalyticsContext {
+  return { ...fallback, ...current };
+}
+
 function getHostedOAuthCallbackErrorMessage(): string {
   const params = new URLSearchParams(window.location.search);
   const error = params.get("error");
@@ -484,6 +548,8 @@ function BillingHandoffLoading({ overlay = false }: { overlay?: boolean }) {
     </div>
   );
 }
+
+const GUEST_ROW_RELOAD_KEY = "mcpjam:guest-row-reload";
 
 function UserSetupError() {
   return (
@@ -2715,6 +2781,8 @@ export default function App() {
   const [pendingFirstRunConnection, setPendingFirstRunConnection] =
     useState<ServerFormData | null>(null);
   const firstRunConnectionAttemptRef = useRef(0);
+  const firstRunAnalyticsContextRef =
+    useRef<FirstRunConnectionAnalyticsContext | null>(null);
   const restoredFirstRunSelectionRef = useRef<string | null>(null);
   const restoredFirstRunServerRef = useRef<string | null>(null);
   // Bumped to ask the active debugger route to open its own "configure server"
@@ -2762,6 +2830,9 @@ export default function App() {
   } = useAuth();
   const { isAuthenticated, isLoading: isAuthLoading } = useConvexAuth();
   const actorKey = useActorKey();
+  // Gates the error card's "Report this": reports need an account, and the
+  // identity Convex holds (not WorkOS's) is the one the write would run as.
+  const isFeedbackMember = useIsMemberActor();
   const currentUser = useQuery(
     "users:getCurrentUser" as any,
     isAuthenticated ? ({} as any) : "skip",
@@ -3127,6 +3198,52 @@ export default function App() {
     isMcpOAuthCallback &&
     getHostedOAuthCallbackContext()?.surface === "project";
   const electronMcpCallbackUrl = buildElectronMcpCallbackUrl();
+  // A guest whose row vanished was most likely promoted in another tab; a
+  // reload picks up the shared AuthKit session. The sessionStorage flag allows
+  // one reload per tab until a user row is back, and never on a one-shot
+  // callback URL or the hosted chat route.
+  const [guestReloadUsed, setGuestReloadUsed] = useState(() => {
+    try {
+      return sessionStorage.getItem(GUEST_ROW_RELOAD_KEY) !== null;
+    } catch {
+      return true;
+    }
+  });
+  const shouldReloadForMissingGuest =
+    !isHostedChatRoute &&
+    !isOAuthCallback &&
+    !isMcpOAuthCallback &&
+    isAuthenticated &&
+    !workOsUser &&
+    !isWorkOsLoading &&
+    currentUser === null &&
+    isUserReady &&
+    !guestReloadUsed;
+  const hasCurrentUser = currentUser != null;
+  useEffect(() => {
+    if (!shouldReloadForMissingGuest) {
+      if (hasCurrentUser && guestReloadUsed) {
+        try {
+          sessionStorage.removeItem(GUEST_ROW_RELOAD_KEY);
+        } catch {
+          // Re-arm in memory anyway; setItem below falls back to the setup error.
+        }
+        setGuestReloadUsed(false);
+      }
+      return;
+    }
+    try {
+      sessionStorage.setItem(GUEST_ROW_RELOAD_KEY, "1");
+    } catch {
+      // Without storage there is no loop guard: show the setup error instead.
+      setGuestReloadUsed(true);
+      return;
+    }
+    window.location.reload();
+    // A cancelled unload leaves the page alive: fall back to the setup error.
+    const fallback = window.setTimeout(() => setGuestReloadUsed(true), 10_000);
+    return () => window.clearTimeout(fallback);
+  }, [shouldReloadForMissingGuest, hasCurrentUser, guestReloadUsed]);
 
   useEffect(() => {
     if (!isOAuthCallback) {
@@ -3554,8 +3671,15 @@ export default function App() {
           draft.authentication === "auto" || draft.authentication === "oauth",
         authMethod: draft.authentication,
       };
+      const analyticsContext = firstRunAnalyticsContextFromDraft(
+        "personal",
+        formData,
+      );
+      firstRunAnalyticsContextRef.current = analyticsContext;
+      trackFirstRunServerSelected(analyticsContext);
       const validationError = validateServerFormData(formData);
       if (validationError) {
+        trackFirstRunConnectionFailed(analyticsContext, "validation");
         setFirstRunConnectionState({
           status: "failed",
           serverName: formData.name,
@@ -3578,6 +3702,12 @@ export default function App() {
   );
 
   const connectFirstRunDemo = useCallback(() => {
+    const analyticsContext = firstRunAnalyticsContextFromDraft(
+      "demo",
+      EXCALIDRAW_SERVER_CONFIG,
+    );
+    firstRunAnalyticsContextRef.current = analyticsContext;
+    trackFirstRunServerSelected(analyticsContext);
     firstRunConnectionAttemptRef.current += 1;
     markFirstRunServerChoiceStarted(EXCALIDRAW_SERVER_CONFIG.name);
     setPendingFirstRunConnection(EXCALIDRAW_SERVER_CONFIG);
@@ -3613,6 +3743,12 @@ export default function App() {
       serverName: pendingFirstRunConnection.name,
       serverKind: firstRunConnectionState.serverKind,
     });
+    const analyticsContext = firstRunAnalyticsContextFromDraft(
+      firstRunConnectionState.serverKind,
+      pendingFirstRunConnection,
+    );
+    firstRunAnalyticsContextRef.current = analyticsContext;
+    trackFirstRunConnectionStarted(analyticsContext);
     void handleConnect(pendingFirstRunConnection, {
       suppressErrorToast: true,
       suppressSuccessToast: true,
@@ -3660,6 +3796,11 @@ export default function App() {
     if (server.connectionStatus === "connected") {
       const attemptId = firstRunConnectionAttemptRef.current;
       const { serverKind, serverName } = firstRunConnectionState;
+      const analyticsContext = mergeFirstRunAnalyticsContext(
+        firstRunAnalyticsContextRef.current,
+        firstRunAnalyticsContextFromServer(serverKind, server),
+      );
+      firstRunAnalyticsContextRef.current = analyticsContext;
       setPendingFirstRunConnection(null);
       setFirstRunConnectionState({
         status: "loading-tools",
@@ -3672,6 +3813,11 @@ export default function App() {
           // Persist the real outcome before the user presses the final CTA so
           // a refresh cannot replay onboarding after a successful handshake.
           markFirstRunServerChoiceConnected(serverKind, tools.length);
+          trackFirstRunConnectionSucceeded(
+            analyticsContext,
+            "tools_loaded",
+            tools.length,
+          );
           setFirstRunConnectionState({
             status: "connected",
             serverName,
@@ -3685,6 +3831,7 @@ export default function App() {
           // Keep the server connected and let Playground retry discovery
           // rather than presenting a false connection failure.
           markFirstRunServerChoiceConnected(serverKind, null);
+          trackFirstRunConnectionSucceeded(analyticsContext, "handshake_only");
           setFirstRunConnectionState({
             status: "connected",
             serverName,
@@ -3696,6 +3843,15 @@ export default function App() {
     }
 
     if (server.connectionStatus === "failed") {
+      const analyticsContext = mergeFirstRunAnalyticsContext(
+        firstRunAnalyticsContextRef.current,
+        firstRunAnalyticsContextFromServer(
+          firstRunConnectionState.serverKind,
+          server,
+        ),
+      );
+      firstRunAnalyticsContextRef.current = analyticsContext;
+      trackFirstRunConnectionFailed(analyticsContext, "handshake");
       setPendingFirstRunConnection(null);
       setFirstRunConnectionState({
         status: "failed",
@@ -3759,32 +3915,65 @@ export default function App() {
     firstRunConnectionAttemptRef.current += 1;
     setPendingFirstRunConnection(null);
     if (firstRunConnectionState.status !== "idle") {
+      const server = appState.servers[firstRunConnectionState.serverName];
+      const analyticsContext = mergeFirstRunAnalyticsContext(
+        firstRunAnalyticsContextRef.current,
+        firstRunAnalyticsContextFromServer(
+          firstRunConnectionState.serverKind,
+          server,
+        ),
+      );
+      const cancelStage: FirstRunCancelStage =
+        firstRunConnectionState.status === "preparing"
+          ? "project_preparing"
+          : firstRunConnectionState.status === "loading-tools"
+          ? "loading_tools"
+          : "connecting";
+      trackFirstRunConnectionCancelled(analyticsContext, cancelStage);
       handleRuntimeDisconnect(firstRunConnectionState.serverName);
     }
+    firstRunAnalyticsContextRef.current = null;
     setFirstRunConnectionState({ status: "idle" });
-  }, [firstRunConnectionState, handleRuntimeDisconnect]);
+  }, [appState.servers, firstRunConnectionState, handleRuntimeDisconnect]);
 
   const returnToFirstRunChoice = useCallback(() => {
     firstRunConnectionAttemptRef.current += 1;
     setPendingFirstRunConnection(null);
+    firstRunAnalyticsContextRef.current = null;
     setFirstRunConnectionState({ status: "idle" });
   }, []);
 
   const openFirstRunPlayground = useCallback(() => {
+    if (firstRunConnectionState.status === "connected") {
+      const server = appState.servers[firstRunConnectionState.serverName];
+      const analyticsContext = mergeFirstRunAnalyticsContext(
+        firstRunAnalyticsContextRef.current,
+        firstRunAnalyticsContextFromServer(
+          firstRunConnectionState.serverKind,
+          server,
+        ),
+      );
+      trackFirstRunPlaygroundOpened(
+        analyticsContext,
+        firstRunConnectionState.toolCount ?? undefined,
+      );
+    }
     firstRunConnectionAttemptRef.current += 1;
     setPendingFirstRunConnection(null);
+    firstRunAnalyticsContextRef.current = null;
     setFirstRunConnectionState({ status: "idle" });
     setFirstRunOverlayDismissed(true);
     setFirstRunPlaygroundPrompt(PLAYGROUND_FIRST_RUN_PROMPT);
     markFirstRunServerChoiceCompleted();
     markFirstRunPlaygroundPromptPending();
     navigateApp(routePaths.playground);
-  }, [navigateApp]);
+  }, [appState.servers, firstRunConnectionState, navigateApp]);
 
   const dismissFirstRunOverlay = useCallback(() => {
     firstRunConnectionAttemptRef.current += 1;
     markFirstRunServerChoiceDismissed();
     setPendingFirstRunConnection(null);
+    firstRunAnalyticsContextRef.current = null;
     setFirstRunConnectionState({ status: "idle" });
     setFirstRunOverlayDismissed(true);
   }, []);
@@ -3946,7 +4135,8 @@ export default function App() {
     activeProject?.clientConfig,
   );
   const convexProjectId = activeProject?.sharedProjectId ?? null;
-  const canQueryProjectServerConfig = isUserReady && Boolean(convexProjectId);
+  const canQueryProjectServerConfig =
+    isUserReady && shouldQueryProjectId(convexProjectId);
   const projectServerConfigDto = useQuery(
     "projectServerConfig:getConfig" as never,
     canQueryProjectServerConfig
@@ -3956,7 +4146,8 @@ export default function App() {
   // A skipped query reads as `undefined`, so this already covers the window
   // where `canQueryProjectServerConfig` is false for a project-scoped session.
   const isProjectServerConfigLoading =
-    Boolean(convexProjectId) && projectServerConfigDto === undefined;
+    shouldQueryProjectId(convexProjectId) &&
+    projectServerConfigDto === undefined;
   // hostsTabSelectedHostId is a Hosts-tab-local cursor; drop it when scope
   // changes so it can't bleed across projects. `activeHostId` is owned by
   // useAppState (project-keyed in localStorage) and self-resets.
@@ -5449,7 +5640,10 @@ export default function App() {
     (currentUser === undefined ||
       // Session revocation can return a null user before Convex's auth state
       // changes or WorkOS finishes navigating away. That is expected at logout.
-      (currentUser === null && (isEnsuringUser || isSignOutInProgress())))
+      (currentUser === null &&
+        (isEnsuringUser ||
+          isSignOutInProgress() ||
+          shouldReloadForMissingGuest)))
   ) {
     return <LoadingScreen />;
   }
@@ -5956,7 +6150,13 @@ export default function App() {
                 ) : isBareCaniuseRoute ? (
                   bareCompareContent
                 ) : (
-                  appContent
+                  // The app shell's error cards may offer "Report this" to a
+                  // signed-in member on the hosted app, and to nobody else.
+                  <FeedbackReporterProvider
+                    enabled={HOSTED_MODE && isFeedbackMember === true}
+                  >
+                    {appContent}
+                  </FeedbackReporterProvider>
                 )}
               </HostedShellGate>
               <FirstRunOnboardingOverlay

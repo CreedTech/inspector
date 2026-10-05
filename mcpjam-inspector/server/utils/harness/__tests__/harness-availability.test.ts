@@ -2,8 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   checkHarnessRuntimeAvailable,
   harnessModelEligibleForRuntime,
+  harnessReasoningEffortRefusalReason,
   harnessToolApprovalRefusalReason,
+  readReasoningEffort,
+  selectionReasoningEffort,
+  turnReasoningEffortOf,
 } from "../harness-availability";
+import { HARNESS_REASONING_EFFORTS } from "@mcpjam/sdk/host-config/internal";
+import { MODEL_REASONING_EFFORTS } from "@mcpjam/sdk/browser";
 import { registeredHarnessIds } from "../registry";
 import { getHarnessAdapter, type HarnessId } from "../registry";
 
@@ -745,5 +751,194 @@ describe("version-keyed model support (evidence table)", () => {
     expect(
       harnessModelEligibleForRuntime({ adapter, ...model, purpose: "chat" }),
     ).toBe(true);
+  });
+});
+
+describe("reasoning effort on a harness (refuse, never drop)", () => {
+  it("no effort is never a refusal", () => {
+    setFullyAvailable();
+    expect(checkHarnessRuntimeAvailable(args())).toEqual({ ok: true });
+  });
+
+  it.each([
+    ["claude-code", "anthropic/claude-haiku-4.5", "high"],
+    ["codex", "openai/gpt-5-nano", "max"],
+    ["codex", "openai/gpt-5-nano", "none"],
+  ] as const)(
+    "refuses an effort %s has not verified, before any model rule",
+    (harnessId, modelId, reasoningEffort) => {
+      setFullyAvailable();
+      const verdict = checkHarnessRuntimeAvailable(
+        args({
+          harnessId,
+          model: { id: modelId },
+          reasoningEffort,
+        }),
+      );
+      expect(verdict.ok).toBe(false);
+      if (verdict.ok) throw new Error("unreachable");
+      expect(verdict.kind).toBe("setting-unsupported");
+      expect(verdict.reason).toContain(getHarnessAdapter(harnessId).displayName);
+      expect(verdict.reason).toContain(`"${reasoningEffort}"`);
+    },
+  );
+
+  it.each(["low", "medium", "high", "xhigh"] as const)(
+    "admits the verified Codex effort %s",
+    (reasoningEffort) => {
+      setFullyAvailable();
+      expect(
+        checkHarnessRuntimeAvailable(
+          args({
+            harnessId: "codex",
+            model: { id: "openai/gpt-5-nano" },
+            reasoningEffort,
+          }),
+        ),
+      ).toEqual({ ok: true });
+    },
+  );
+
+  // STILL REFUSED PENDING THE LIVE CHECK. Claude Code's mapping code exists
+  // (`effort` option + adaptive thinking + the effort env), but the evidence
+  // that the AI Gateway accepts it (adaptive thinking + `output_config.effort`
+  // per model, and the wire effort at the proxy) needs staging access that has
+  // not been run. Until those rows exist this must stay empty: do not add a
+  // level to `HARNESS_REASONING_EFFORTS["claude-code"]` without that evidence.
+  it.each(MODEL_REASONING_EFFORTS)(
+    "still refuses %s on Claude Code (live check pending)",
+    (reasoningEffort) => {
+      setFullyAvailable();
+      expect(HARNESS_REASONING_EFFORTS["claude-code"]).toEqual([]);
+      expect(getHarnessAdapter("claude-code").supportedReasoningEfforts).toEqual(
+        [],
+      );
+      const verdict = checkHarnessRuntimeAvailable(
+        args({
+          harnessId: "claude-code",
+          model: { id: "anthropic/claude-haiku-4.5" },
+          reasoningEffort,
+        }),
+      );
+      expect(verdict.ok).toBe(false);
+      if (verdict.ok) throw new Error("unreachable");
+      expect(verdict.kind).toBe("setting-unsupported");
+    },
+  );
+
+  it("refuses an effort on Cursor (external account) too", () => {
+    setFullyAvailable();
+    const verdict = checkHarnessRuntimeAvailable(
+      args({
+        harnessId: "cursor",
+        model: { id: "cursor/auto" },
+        hostModelId: "cursor/auto",
+        reasoningEffort: "low",
+      }),
+    );
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) throw new Error("unreachable");
+    expect(verdict.kind).toBe("setting-unsupported");
+  });
+
+  it("the helper allows an effort the adapter lists and refuses the rest", () => {
+    const adapter = {
+      ...getHarnessAdapter("codex"),
+      supportedReasoningEfforts: ["low", "medium"],
+    } as ReturnType<typeof getHarnessAdapter>;
+    expect(
+      harnessReasoningEffortRefusalReason({ adapter, reasoningEffort: "low" }),
+    ).toBeUndefined();
+    const reason = harnessReasoningEffortRefusalReason({
+      adapter,
+      reasoningEffort: "high",
+    });
+    expect(reason).toContain('"low", "medium"');
+  });
+});
+
+describe("an effort the adapter applies but the model does not list", () => {
+  it("is refused up front, before any sandbox is reserved", () => {
+    const adapter = getHarnessAdapter("codex");
+    expect(
+      harnessReasoningEffortRefusalReason({
+        adapter,
+        reasoningEffort: "xhigh",
+        modelEfforts: ["minimal", "low", "medium", "high"],
+      }),
+    ).toContain('doesn\'t accept the "xhigh"');
+    expect(
+      harnessReasoningEffortRefusalReason({
+        adapter,
+        reasoningEffort: "high",
+        modelEfforts: ["minimal", "low", "medium", "high"],
+      }),
+    ).toBeUndefined();
+    // Unknown model levels are not checked here (the SDK picker fails closed).
+    expect(
+      harnessReasoningEffortRefusalReason({ adapter, reasoningEffort: "xhigh" }),
+    ).toBeUndefined();
+  });
+});
+
+describe("reading an effort off untyped input", () => {
+  it("accepts only the SDK's levels", () => {
+    expect(readReasoningEffort("xhigh")).toBe("xhigh");
+    expect(readReasoningEffort("ultra")).toBeUndefined();
+    expect(readReasoningEffort(3)).toBeUndefined();
+  });
+
+  it("reads settings.reasoningEffort off a selection", () => {
+    expect(
+      selectionReasoningEffort({ settings: { reasoningEffort: "low" } }),
+    ).toBe("low");
+    expect(selectionReasoningEffort({ settings: {} })).toBeUndefined();
+    expect(selectionReasoningEffort(undefined)).toBeUndefined();
+    expect(selectionReasoningEffort("nope")).toBeUndefined();
+  });
+});
+
+describe("the effort a turn asked for", () => {
+  it("reads the typed field, then the top-level body field, then the selection", () => {
+    const selection = { settings: { reasoningEffort: "low" } };
+    expect(
+      turnReasoningEffortOf({
+        reasoningEffort: "high",
+        extraBodyFields: { reasoningEffort: "medium", modelSelection: selection },
+      }),
+    ).toBe("high");
+    expect(
+      turnReasoningEffortOf({
+        extraBodyFields: { reasoningEffort: "medium", modelSelection: selection },
+      }),
+    ).toBe("medium");
+    expect(
+      turnReasoningEffortOf({ extraBodyFields: { modelSelection: selection } }),
+    ).toBe("low");
+    expect(turnReasoningEffortOf({ extraBodyFields: {} })).toBeUndefined();
+  });
+});
+
+describe("every harness adapter either applies an effort or declares none", () => {
+  it.each(registeredHarnessIds())("%s", (id) => {
+    const adapter = getHarnessAdapter(id);
+    // The declaration is the SDK table the pickers read, so the UI never
+    // offers what the gate would refuse.
+    expect(adapter.supportedReasoningEfforts).toEqual(
+      HARNESS_REASONING_EFFORTS[id],
+    );
+    // An adapter that lists an effort must accept it through createHarness
+    // (its own runtime option). Today every adapter lists none, so this proves
+    // itself the day one starts to.
+    for (const reasoningEffort of adapter.supportedReasoningEfforts) {
+      expect(() =>
+        adapter.createHarness({
+          modelId: "openai/gpt-5-nano",
+          auth: {},
+          mcpJson: { mcpServers: {} },
+          reasoningEffort,
+        } as never),
+      ).not.toThrow();
+    }
   });
 });

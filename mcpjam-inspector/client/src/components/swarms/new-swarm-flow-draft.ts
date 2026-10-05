@@ -27,6 +27,7 @@
  */
 import {
   emptyModelSelection,
+  parseStoredModelSelection,
   type EnvironmentComposerState,
 } from "@/components/environment-composer/environment-stack";
 import type {
@@ -139,6 +140,13 @@ export type NewSwarmFlowDraft = {
    * Describe step.
    */
   generatingSince: number | null;
+  /**
+   * Name of an attachment still being read, or null. Same reason as
+   * `generatingSince`: the read dies with the unmounted component, so the
+   * restored Describe step says so instead of silently missing the file.
+   * Optional so drafts written before it existed still restore.
+   */
+  attachingFile?: string | null;
   launch: NewSwarmLaunchIdentity;
 };
 
@@ -261,24 +269,23 @@ function isComposerState(value: unknown): value is EnvironmentComposerState {
  *
  * The shape is tolerated rather than required, like `name` above — a draft
  * written before the model slot existed is still resumable, and its stack is
- * exactly what a client-defaults selection means. Normalizing on the way out
- * keeps every reader working on a complete stack.
+ * exactly what a client-defaults selection means. A draft written before
+ * targets were keyed by `comparisonKey` (parallel `explicitModelIds` +
+ * `explicitModelSelections`) is read into `explicitTargets`. Normalizing on
+ * the way out keeps every reader working on a complete stack.
  */
 function withModelSelection(
   state: EnvironmentComposerState,
 ): EnvironmentComposerState {
-  const selection = (state.stack as { modelSelection?: unknown })
-    .modelSelection;
-  if (
-    isRecord(selection) &&
-    typeof selection.includeClientDefaults === "boolean" &&
-    isStringArray(selection.explicitModelIds)
-  ) {
-    return state;
-  }
+  const selection = parseStoredModelSelection(
+    (state.stack as { modelSelection?: unknown }).modelSelection,
+  );
   return {
     ...state,
-    stack: { ...state.stack, modelSelection: emptyModelSelection() },
+    stack: {
+      ...state.stack,
+      modelSelection: selection ?? emptyModelSelection(),
+    },
   };
 }
 
@@ -374,6 +381,8 @@ function parseDraft(value: unknown): NewSwarmFlowDraft | null {
     launchedRuns: value.launchedRuns,
     runLabels: value.runLabels,
     generatingSince: value.generatingSince,
+    attachingFile:
+      typeof value.attachingFile === "string" ? value.attachingFile : null,
     launch: value.launch,
   };
 }

@@ -46,7 +46,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@mcpjam/design-system/tooltip";
-import { ModelSelector } from "@/components/chat-v2/chat-input/model-selector";
+import {
+  ModelSelector,
+  type ModelSelectorEffortProps,
+} from "@/components/chat-v2/chat-input/model-selector";
+import { EffortControl } from "@/components/effort/effort-control";
+import { reasoningEffortDefaultForRow } from "@/lib/reasoning-effort-options";
+import type { ModelReasoningEffort } from "@mcpjam/sdk/browser";
 import {
   ClientSelector,
   type ClientSelectorData,
@@ -315,6 +321,22 @@ interface ChatInputProps {
   onSystemPromptChange: (prompt: string) => void;
   temperature: number;
   onTemperatureChange: (temperature: number) => void;
+  /**
+   * Reasoning effort chip beside the model picker. In compare mode the
+   * caller passes the lead card's effort (each card has its own chip too).
+   * `reasoningEffortLevels` is the row's supported list; empty hides the chip.
+   * While an effort is set the temperature slider is disabled and the turn
+   * omits temperature.
+   */
+  reasoningEffort?: ModelReasoningEffort;
+  reasoningEffortLevels?: readonly ModelReasoningEffort[];
+  onReasoningEffortChange?: (effort: ModelReasoningEffort | undefined) => void;
+  /**
+   * Efforts in the model menu: each model opens its efforts to the side
+   * (single mode picks model + effort; compare mode toggles model × effort
+   * panes). Omitted, the menu picks models only.
+   */
+  modelEfforts?: ModelSelectorEffortProps;
   hasMessages?: boolean;
   onResetChat: () => void;
   tokenUsage?: {
@@ -451,6 +473,10 @@ export function ChatInput({
   onSystemPromptChange,
   temperature,
   onTemperatureChange,
+  reasoningEffort,
+  reasoningEffortLevels,
+  onReasoningEffortChange,
+  modelEfforts,
   onResetChat,
   hasMessages = false,
   tokenUsage,
@@ -1950,28 +1976,8 @@ export function ChatInput({
                               onCheckedChange={(checked) =>
                                 onRequireToolApprovalChange(checked)
                               }
-                              aria-describedby="tool-approval-floor-note"
                             />
                           </div>
-                          {/* A caption rather than a tooltip: the row contains
-                              the switch itself, so a tooltip trigger wrapped
-                              around it would open over the control the user is
-                              reaching for, and a non-focusable trigger div
-                              would never open for a keyboard user at all.
-                              The switch decides for every tool that acts, so
-                              the only thing left to say is which calls it does
-                              not cover — reads, and an app's own tools, which
-                              belong to the iframe the user opened rather than
-                              to this setting. That belongs in front of someone
-                              rather than behind a hover. */}
-                          <p
-                            id="tool-approval-floor-note"
-                            className="mt-1 pl-6 text-[11px] leading-snug text-muted-foreground"
-                          >
-                            Pause before tool calls: MCP servers, the browser,
-                            a page's own tools, the shell. Read-only lookups
-                            and an open app's own actions never pause.
-                          </p>
                         </div>
                       )}
 
@@ -2023,12 +2029,26 @@ export function ChatInput({
                   onMultiModelEnabledChange={onMultiModelEnabledChange}
                   respondToProviderTabIntent
                   onManageOrgProviders={onManageOrgProviders}
+                  {...modelEfforts}
                   // Servers attached means the turn can call tools.
                   workload={
                     (selectedServers?.length ?? 0) > 0 ? "mcpChat" : "chat"
                   }
                 />
               )}
+              {/* In compare mode the chip edits the lead card's effort; every
+                  card also has its own chip and sends its own level. */}
+              {!minimalMode && onReasoningEffortChange ? (
+                <EffortControl
+                  variant="inline"
+                  options={reasoningEffortLevels ?? []}
+                  value={reasoningEffort}
+                  defaultLevel={reasoningEffortDefaultForRow(currentModel)}
+                  onChange={onReasoningEffortChange}
+                  disabled={isLoading}
+                  disabledReason="Reasoning effort can't change while a reply is streaming"
+                />
+              ) : null}
             </div>
 
             <div className="flex items-center gap-2 flex-shrink-0">
@@ -2246,6 +2266,7 @@ export function ChatInput({
           onSystemPromptChange={onSystemPromptChange}
           temperature={temperature}
           onTemperatureChange={onTemperatureChange}
+          reasoningEffort={reasoningEffort}
           isLoading={isLoading}
           hasMessages={hasMessages}
           onResetChat={onResetChat}

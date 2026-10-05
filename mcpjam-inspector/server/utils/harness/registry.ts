@@ -16,6 +16,7 @@ export { patchClaudeCodeHarnessBootstrap } from "./claude-code-bootstrap.js";
 import { createCodex } from "@ai-sdk/harness-codex";
 import { createCursor } from "@ai-sdk/harness-cursor";
 import { createCodexAppServer } from "./codex-appserver/index.js";
+import type { CodexWorkspaceWriteSandboxPolicy } from "./codex-appserver/shared/sandbox-policy.js";
 import { codexAppServerTransportEnabled } from "./harness-flags.js";
 import type { HarnessAgentAdapter } from "@ai-sdk/harness/agent";
 import type {
@@ -23,7 +24,11 @@ import type {
   HarnessV1PermissionMode,
 } from "@ai-sdk/harness";
 import { asSchema } from "ai";
-import { type Harness } from "@mcpjam/sdk/host-config/internal";
+import {
+  HARNESS_REASONING_EFFORTS,
+  type Harness,
+} from "@mcpjam/sdk/host-config/internal";
+import type { ModelReasoningEffort } from "@mcpjam/sdk/browser";
 import {
   harnessModelSupport,
   harnessPinnedVersion,
@@ -300,8 +305,34 @@ type HarnessRuntimeAdapterBase = {
    * fingerprint, so adding this field forks no existing session.
    */
   transport?: "exec" | "app-server";
+  /**
+   * Does a PENDING approval live in the runtime PROCESS rather than on disk?
+   *
+   * Claude Code's conversation is on disk, so a local turn paused on an
+   * approval can be torn down and re-driven. Codex app-server's pending
+   * approval is an open JSON-RPC request inside one live process (and, for a
+   * host tool, an open relay call), so a local pause must PARK that process
+   * (`local/approval-park.ts`) and the decision must be delivered to it —
+   * never replayed into a new one.
+   */
+  liveApprovalRuntime?: boolean;
+  /**
+   * The adapter applies `HarnessCreateArgs.sandboxPolicy` to its runtime. An
+   * adapter without this flag cannot contain an unattended local turn, so the
+   * turn runner refuses to start one rather than run it unrestricted.
+   */
+  acceptsSandboxPolicy?: boolean;
   /** Human-facing runtime name for preflight/availability messages + UI. */
   displayName: string;
+  /**
+   * The reasoning efforts this adapter is VERIFIED to apply when handed one
+   * through `HarnessCreateArgs.reasoningEffort`. Declared per adapter and
+   * REQUIRED, so a new adapter has to say (empty = "none yet"): a saved
+   * effort on a harness host is refused before any spend when the adapter
+   * does not list it, never silently dropped. Read from the SDK table
+   * (`HARNESS_REASONING_EFFORTS`) so the UI's picker and this gate agree.
+   */
+  supportedReasoningEfforts: readonly ModelReasoningEffort[];
   /** Whether this harness must run inside an attached personal computer. Drives
    *  the availability preflight (data-plane requirement). */
   requiresComputer: boolean;
@@ -439,6 +470,23 @@ type HarnessRuntimeAdapterBase = {
 export type HarnessCreateArgs = {
   modelId: string;
   auth: HarnessAuth;
+  /**
+   * The reasoning effort this turn asked for. An adapter that lists efforts in
+   * `supportedReasoningEfforts` MUST apply it through its own runtime option;
+   * one that lists none never receives it (the refusal helper stops the turn
+   * first), so a value arriving here is always one the adapter declared.
+   */
+  reasoningEffort?: ModelReasoningEffort;
+  /**
+   * The command-sandbox policy an UNATTENDED local turn runs under (D2), set
+   * only by the local arm from the compatibility manifest
+   * (`localSandboxPolicyFor`). It is not a permission mode: the turn is
+   * `allow-all` because nobody is there to approve, and this policy is what
+   * contains its commands. Only an adapter with `acceptsSandboxPolicy` may
+   * receive it; the turn refuses to hand it to any other rather than let it be
+   * silently dropped.
+   */
+  sandboxPolicy?: Readonly<CodexWorkspaceWriteSandboxPolicy>;
 };
 
 /** Brokered model access: MCPJam supplies the credential, so the adapter needs
@@ -750,6 +798,11 @@ function memoizedBuiltinTools(
 const claudeCodeAdapter: HarnessRuntimeAdapter = {
   id: "claude-code",
   displayName: "Claude Code",
+  // Nothing verified yet: an effort on this harness is refused, not dropped.
+  // `createHarness` below already maps an effort (`effort` option + adaptive
+  // thinking), but it stays inert (the SDK row is empty) until the live check
+  // against the AI Gateway verifies it. See `HARNESS_REASONING_EFFORTS`.
+  supportedReasoningEfforts: HARNESS_REASONING_EFFORTS["claude-code"],
   requiresComputer: true,
   // MCPJam brokers the model credential: Convex mints a lease, E2B injects it
   // outside the VM, and the model proxy meters the spend.
@@ -816,7 +869,7 @@ const claudeCodeAdapter: HarnessRuntimeAdapter = {
   modelSupport: modelSupportFor("claude-code"),
   supportsModel: supportsModelFor("claude-code"),
   parseToolName: parseHarnessToolName,
-  createHarness({ modelId, auth, mcpJson }) {
+  createHarness({ modelId, auth, mcpJson, reasoningEffort }) {
     const nativeModel = toClaudeCodeModel(modelId);
     return createClaudeCodeHarness({
       mcpServers: mcpJson.mcpServers,
@@ -828,7 +881,11 @@ const claudeCodeAdapter: HarnessRuntimeAdapter = {
       // gateway accepts adaptive. (`"off"` on the canary line; the stable
       // line takes the richer `{ type }` config, where `'disabled'` is the
       // same wire behavior.)
-      thinking: { type: "disabled" },
+      //
+      // WITH an effort the turn asks for adaptive thinking (the only shape the
+      // `effort` option controls), so the disabled pin is dropped for it.
+      // A turn with no effort keeps the exact options above.
+      ...(reasoningEffort ? {} : { thinking: { type: "disabled" as const } }),
       // AI Gateway's Anthropic-compat schema rejects the newer
       // output_config.effort request field ("400 output_config.effort: Extra
       // inputs are not permitted"). "unset" makes the CLI omit the field
@@ -840,7 +897,16 @@ const claudeCodeAdapter: HarnessRuntimeAdapter = {
       // env, so unlike `??=` it is now authoritative rather than a default —
       // deliberate: the sandbox env is ours, and the adapter's own `effort`
       // option is the supported way to ask for a value.
-      env: { CLAUDE_CODE_EFFORT_LEVEL: "unset" },
+      //
+      // With an effort, the env is set to that level instead: it beats the
+      // `--effort` flag, so leaving "unset" would silently drop the request.
+      ...(reasoningEffort
+        ? {
+            effort: reasoningEffort,
+            thinking: { type: "adaptive" as const },
+            env: { CLAUDE_CODE_EFFORT_LEVEL: reasoningEffort },
+          }
+        : { env: { CLAUDE_CODE_EFFORT_LEVEL: "unset" } }),
     });
   },
 };
@@ -851,6 +917,8 @@ const codexExecAdapter: HarnessRuntimeAdapter = {
   // second one exists, so a reader of either arm can tell which is which.
   transport: "exec",
   displayName: "Codex",
+  // Nothing verified yet: an effort on this harness is refused, not dropped.
+  supportedReasoningEfforts: HARNESS_REASONING_EFFORTS["codex"],
   requiresComputer: true,
   // Brokered, same as Claude Code — an OpenAI-protocol lease instead of an
   // Anthropic one.
@@ -925,13 +993,15 @@ const codexExecAdapter: HarnessRuntimeAdapter = {
   // run match a Codex run tool-for-tool. Codex's own natives arrive as common
   // names (`bash`, `read`, …), which have no prefix and pass through unchanged.
   parseToolName: parseHarnessToolName,
-  createHarness({ modelId, auth }) {
+  createHarness({ modelId, auth, reasoningEffort }) {
     const nativeModel = toCodexModel(modelId);
     // Same dual-`ai` boundary cast as Claude Code. `auth.openaiCompatible` is
     // accepted by createCodex — the broker dummy auth always carries an
     // explicit baseUrl so the CLI never reads the host env for it.
     return createCodex({
       ...(nativeModel ? { model: nativeModel } : {}),
+      // Codex's own `reasoningEffort` option (exec transport).
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       auth,
     }) as unknown as HarnessAgentAdapter;
   },
@@ -961,25 +1031,32 @@ const codexExecAdapter: HarnessRuntimeAdapter = {
  *    typed items for shell, patches and web search, so the trace shows what
  *    actually happened.
  *
- * MCP delivery stays HOST-EXECUTED, and that is a deliberate limit rather than
- * an oversight: codex 0.149.1 has no approval request for an MCP `tools/call`
- * at all, so under native delivery a Strict-mode host could not gate one. Host
- * execution keeps MCPJam the authority. Native delivery is a follow-up gated on
- * an answer to that, not on this transport.
+ * MCP delivery stays HOST-EXECUTED, in both venues: every MCP call is relayed
+ * back to this process and runs on its own manager, under the tool policy and
+ * the framework's `toolApproval`, wherever the Codex process itself runs.
+ * Codex 0.149.1 does raise its own approval for an MCP `tools/call` (an
+ * `mcp_tool_call` elicitation, PROBES.md (d)), but the relay is rendered with
+ * `default_tools_approval_mode = "approve"` so MCPJam's gate is the single
+ * authority instead of a second prompt nobody answers. Native delivery stays a
+ * follow-up: it would move enforcement into a process MCPJam does not own.
  */
 const codexAppServerAdapter: HarnessRuntimeAdapter = {
   ...codexExecAdapter,
   transport: "app-server",
+  liveApprovalRuntime: true,
+  // `turn/start.sandboxPolicy`; the bridge refuses `allow-all` without it
+  // whenever it is supervised locally.
+  acceptsSandboxPolicy: true,
   // The pause is real on this transport. `HarnessAgent` also refuses to
   // construct with a non-allow-all mode unless the underlying harness declares
   // `supportsBuiltinToolApprovals`, which `createCodexAppServer` does.
   supportsNativeToolApproval: true,
   // "allow-reads" for the same reason as Claude Code and Cursor: it is the
-  // narrowest mode that still pauses on side-effecting work while leaving reads
-  // free — the faithful mapping to the emulated engine, which gates tool CALLS
-  // and never reads. The bridge maps it to Codex's `untrusted` policy, under
-  // which Codex auto-approves the commands it knows to be read-only and asks
-  // about everything else.
+  // narrowest framework mode that pauses on side-effecting work. The bridge
+  // maps it to Codex's `untrusted` policy, which on 0.149.1 asks about EVERY
+  // command — reads included — and every file change (PROBES.md (c)). So an
+  // approval-gated Codex host prompts more than a Claude Code one; nothing
+  // here may claim reads run without a prompt.
   approvalPermissionMode: "allow-reads",
   // MCPJam's tools run in MCPJam's process and the framework gates them there,
   // before `execute`, through `HarnessAgent`'s `toolApproval` map. This is the
@@ -987,9 +1064,9 @@ const codexAppServerAdapter: HarnessRuntimeAdapter = {
   // MCP delivery is host-executed — so leaving it false would refuse every
   // approval host with a server attached even though the pause works.
   supportsHostExecutedToolApproval: true,
-  // Still false, and NOT because the mechanism is unproven: codex 0.149.1
-  // raises no approval request for an MCP tool call, so there is nothing to
-  // pause on. Only relevant if MCP delivery ever becomes native.
+  // False because MCP delivery is host-executed: MCPJam's own gate applies to
+  // relayed calls (above), and codex's MCP approval is configured off for the
+  // relay. Only relevant if MCP delivery ever becomes native.
   supportsMcpToolApproval: false,
   // The bridge emits patches as a real `tool-call`/`tool-result` pair (an
   // approval must attach to a tool call, and a `file-change` part has no
@@ -997,11 +1074,15 @@ const codexAppServerAdapter: HarnessRuntimeAdapter = {
   // wanted here.
   fileChangeToolName: undefined,
   listBuiltinTools: memoizedBuiltinTools(() => createCodexAppServer()),
-  createHarness({ modelId, auth }) {
+  createHarness({ modelId, auth, sandboxPolicy, reasoningEffort }) {
     const nativeModel = toCodexModel(modelId);
     return createCodexAppServer({
       ...(nativeModel ? { model: nativeModel } : {}),
+      // Forwarded on the bridge `start` message, which sends it as
+      // `turn/start` `effort`.
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       auth,
+      ...(sandboxPolicy ? { sandboxPolicy } : {}),
     }) as unknown as HarnessAgentAdapter;
   },
 };
@@ -1013,6 +1094,8 @@ const cursorAdapter: HarnessRuntimeAdapter = {
   // different surfaces. Every preflight/refusal message a user reads comes from
   // here, so the distinction has to be in the name itself.
   displayName: "Cursor CLI",
+  // Nothing verified yet: an effort on this harness is refused, not dropped.
+  supportedReasoningEfforts: HARNESS_REASONING_EFFORTS["cursor"],
   requiresComputer: true,
   // NO BROKER. cursor-agent has no provider or gateway routing at all: it
   // authenticates with a `CURSOR_API_KEY` (the adapter's own `credentialEnv`
@@ -1187,7 +1270,21 @@ export function isHarnessId(value: unknown): value is HarnessId {
   );
 }
 
-export function getHarnessAdapter(id: string): HarnessRuntimeAdapter {
+export function getHarnessAdapter(
+  id: string,
+  options: {
+    /**
+     * Is this lookup for a turn that runs on the user's own machine? Local
+     * Codex ALWAYS gets the app-server arm, whatever the hosted transport flag
+     * says: the exec arm cannot surface approvals, refuses every mode but
+     * `allow-all`, and is never a local runtime. Every call that decides
+     * something about a local turn — the preflight, the dispatch backstop, the
+     * turn's fingerprint, approval mode and tool catalog — must pass this, or
+     * the preflight and the turn can disagree about which adapter runs.
+     */
+    localExecution?: boolean;
+  } = {},
+): HarnessRuntimeAdapter {
   // Own-property guard: a prototype key (`__proto__`, `constructor`, …) would
   // otherwise resolve to an inherited value and slip past the `!adapter` check,
   // yielding a 500 downstream instead of a controlled unsupported-harness error.
@@ -1205,7 +1302,10 @@ export function getHarnessAdapter(id: string): HarnessRuntimeAdapter {
    * keeps a live session from crossing between them is the runtime
    * fingerprint's `transport` dimension, which forks the lane on a flip.
    */
-  if (id === "codex" && codexAppServerTransportEnabled()) {
+  if (
+    id === "codex" &&
+    (options.localExecution === true || codexAppServerTransportEnabled())
+  ) {
     return codexAppServerAdapter;
   }
   return HARNESS_ADAPTERS[id];

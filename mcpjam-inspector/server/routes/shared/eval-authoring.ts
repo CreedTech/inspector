@@ -7,7 +7,10 @@ import {
 } from "../../services/evals/route-helpers.js";
 import { createAuthorizedManager, callerContextFromHono } from "../web/auth.js";
 import { getConvexBearerForRequest } from "../../utils/v1-convex-token.js";
+import { resolveXaaIssuer } from "../../services/xaa-mint.js";
+import { HOSTED_MODE } from "../../config.js";
 import { logger } from "../../utils/logger.js";
+import { getRequestLogger } from "../../utils/request-logger.js";
 import {
   ErrorCode,
   WebRouteError,
@@ -140,6 +143,24 @@ export async function handleEvalAuthoring(c: Context, local: boolean) {
         requestedEnvironmentId: input.environmentId,
         hasServerOverride: false,
         serverField: "servers",
+      }).catch((error) => {
+        if (
+          !local &&
+          input.source === "markdown" &&
+          error instanceof WebRouteError &&
+          error.details?.reason === "ENVIRONMENT_REQUIRED"
+        ) {
+          getRequestLogger(c, "routes.shared.eval-authoring").event(
+            "eval.import.environment_selection.failed",
+            {
+              projectId: input.projectId,
+              suiteId: input.suiteId,
+              reason: "ENVIRONMENT_REQUIRED",
+            },
+            { sentry: true },
+          );
+        }
+        throw error;
       });
       const environment = environmentId
         ? await resolveEnvironmentForLaunch(convex, {
@@ -155,7 +176,12 @@ export async function handleEvalAuthoring(c: Context, local: boolean) {
             serverIds: environmentServerIds(environment),
             serverNames: environmentServerNames(environment),
           }
-        : await fetchSuiteRunServerSelection(token, input.suiteId, undefined);
+        : await fetchSuiteRunServerSelection(
+            token,
+            input.suiteId,
+            undefined,
+            "authorized",
+          );
       const { manager } = await createAuthorizedManager(
         callerContextFromHono(c),
         token,
@@ -164,7 +190,12 @@ export async function handleEvalAuthoring(c: Context, local: boolean) {
         30_000,
         undefined,
         undefined,
-        { serverNames: selection.serverNames },
+        {
+          serverNames: selection.serverNames,
+          // A Cross-App Access server mints its token with MCPJam as the IdP,
+          // and the ID-JAG's `iss` is this issuer (as on the other eval routes).
+          xaaIssuer: resolveXaaIssuer(c, HOSTED_MODE),
+        },
       );
       let toolSnapshot;
       try {

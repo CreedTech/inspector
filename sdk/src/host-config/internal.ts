@@ -130,6 +130,22 @@ export {
   selectionKey,
   defaultFallbackForPurpose,
 } from "./model-selection.js";
+export {
+  ANTHROPIC_REASONING_EFFORTS,
+  GOOGLE_REASONING_EFFORTS,
+  HARNESS_REASONING_EFFORTS,
+  OPENAI_REASONING_EFFORTS,
+  reasoningEffortProviderOptions,
+  selectionConfigKey,
+  selectionIfMatches,
+  supportedReasoningEfforts,
+  harnessReasoningEfforts,
+} from "./reasoning-effort.js";
+export type {
+  ReasoningEffortProviderOptions,
+  ReasoningEffortRoute,
+  SupportedReasoningEffortsInput,
+} from "./reasoning-effort.js";
 export type {
   ModelSelection,
   ModelSelectionSource,

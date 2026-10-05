@@ -128,6 +128,7 @@ export type {
   PlatformEvalCaseWarning,
   PlatformEvalCaseDeleted,
   PlatformEvalCaseModel,
+  PlatformEvalCaseModelInput,
   PlatformEvalCasesGenerated,
   PlatformEvalCasesImported,
   PlatformEvalStep,
