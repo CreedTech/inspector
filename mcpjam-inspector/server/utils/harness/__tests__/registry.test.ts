@@ -21,6 +21,12 @@ vi.mock("../claude-code-bootstrap.js", async (original) => {
   return { ...actual, createClaudeCodeHarness: vi.fn(actual.createClaudeCodeHarness) };
 });
 import { createClaudeCodeHarness } from "../claude-code-bootstrap.js";
+vi.mock("../codex-appserver/index.js", async (original) => {
+  const actual = await original<typeof import("../codex-appserver/index.js")>();
+  return { ...actual, createCodexAppServer: vi.fn(actual.createCodexAppServer) };
+});
+import { createCodexAppServer } from "../codex-appserver/index.js";
+import { LOCAL_UNATTENDED_SANDBOX_POLICY } from "../codex-appserver/shared/sandbox-policy.js";
 
 describe("harness registry", () => {
   it("returns the claude-code adapter", () => {
@@ -31,17 +37,18 @@ describe("harness registry", () => {
     const a = getHarnessAdapter("codex");
     expect(a.id).toBe("codex");
     expect(a.displayName).toBe("Codex");
-    // Codex: MCP servers arrive as HOST-EXECUTED tools (the CLI never makes an
-    // MCP tool model-callable in the mode the SDK drives), no native plugin
-    // install, can't pause for tool approval — and skills ARE delivered
-    // (INS-8), under its own root.
+    // Codex: MCP servers arrive as HOST-EXECUTED tools (MCPJam's gate is the
+    // single authority), no native plugin install, pauses for tool approval on
+    // the app-server adapter — and skills ARE delivered (INS-8), under its own
+    // root.
+    expect(a.transport).toBe("app-server");
     expect(a.mcpDelivery).toBe("host-executed");
     expect(a.supportsSkills).toBe(true);
     expect(a.skillsBaseDir).toBe("/home/user/.agents/skills");
     expect(a.supportsPluginBundles).toBe(false);
-    expect(a.supportsNativeToolApproval).toBe(false);
+    expect(a.supportsNativeToolApproval).toBe(true);
     expect(a.requiresComputer).toBe(true);
-    expect(a.fileChangeToolName).toBe("fileChange");
+    expect(a.fileChangeToolName).toBeUndefined();
   });
 
   it("every adapter that advertises a capability carries its strategy", () => {
@@ -257,7 +264,6 @@ describe("harness registry", () => {
     // omitted the override the wire id would not be the model asked for.
     const harness = patchClaudeCodeHarnessBootstrap(
       createClaudeCode({
-        model: "claude-fable-5",
         auth: {
           AI_GATEWAY_API_KEY: "test",
           AI_GATEWAY_BASE_URL: "https://ai-gateway.vercel.sh/v1",
@@ -324,10 +330,7 @@ describe("harness registry", () => {
         "@anthropic-ai/claude-code"
       ],
     ).toBe(HARNESS_PINNED_VERSIONS["claude-code"]);
-    expect(
-      bridgePkg("@ai-sdk/harness-codex").dependencies["@openai/codex-sdk"],
-    ).toBe(HARNESS_PINNED_VERSIONS.codex);
-    // The app-server transport pins the same CLI.
+    // Codex's app-server bootstrap pins its CLI itself.
     expect(PINNED_CODEX_VERSION).toBe(HARNESS_PINNED_VERSIONS.codex);
   });
 
@@ -493,7 +496,6 @@ const toUserMessage = (options) => ({
   it("patches the installed Claude Code bridge bootstrap", async () => {
     const harness = patchClaudeCodeHarnessBootstrap(
       createClaudeCode({
-        model: "haiku",
         // Stable's environment auth arm (the canary `gateway` object is gone).
         auth: {
           AI_GATEWAY_API_KEY: "test",
@@ -528,7 +530,6 @@ const toUserMessage = (options) => ({
 
   it("enforces strict MCP config on previously patched bridges and remains idempotent", async () => {
     const original = patchClaudeCodeHarnessBootstrap(createClaudeCode({
-      model: "haiku",
       auth: { AI_GATEWAY_API_KEY: "test", AI_GATEWAY_BASE_URL: "https://ai-gateway.vercel.sh/v1" },
     }) as any);
     const bootstrap = (await original.getBootstrap?.())!;
@@ -564,7 +565,6 @@ const toUserMessage = (options) => ({
   it("writes an .npmrc that lets the bootstrap's pnpm run build scripts", async () => {
     const harness = patchClaudeCodeHarnessBootstrap(
       createClaudeCode({
-        model: "haiku",
         auth: {
           AI_GATEWAY_API_KEY: "test",
           AI_GATEWAY_BASE_URL: "https://ai-gateway.vercel.sh/v1",
@@ -939,6 +939,34 @@ describe("cursor adapter (Cursor CLI / ACP)", () => {
       getHarnessAdapter("claude-code").runtimeVersionCommand,
     ).toBeUndefined();
     expect(getHarnessAdapter("codex").runtimeVersionCommand).toBeUndefined();
+  });
+});
+
+describe("the Codex adapter and its command sandbox policy (D2)", () => {
+  const auth = buildBrokerDummyAuth("codex", "https://broker.example/openai/v1");
+
+  it("is the app-server transport, and the only adapter that applies a sandbox policy", () => {
+    const local = getHarnessAdapter("codex");
+    expect(local.transport).toBe("app-server");
+    expect(local.acceptsSandboxPolicy).toBe(true);
+    expect(getHarnessAdapter("claude-code").acceptsSandboxPolicy).toBeFalsy();
+  });
+
+  it("hands the policy to the runtime when, and only when, the turn sets one", () => {
+    const local = getHarnessAdapter("codex");
+    vi.mocked(createCodexAppServer).mockClear();
+    local.createHarness({
+      modelId: "openai/gpt-5.5",
+      auth,
+      sandboxPolicy: LOCAL_UNATTENDED_SANDBOX_POLICY,
+    } as never);
+    expect(createCodexAppServer).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sandboxPolicy: LOCAL_UNATTENDED_SANDBOX_POLICY }),
+    );
+    local.createHarness({ modelId: "openai/gpt-5.5", auth } as never);
+    expect(
+      vi.mocked(createCodexAppServer).mock.lastCall?.[0],
+    ).not.toHaveProperty("sandboxPolicy");
   });
 });
 
